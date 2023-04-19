@@ -1,40 +1,39 @@
 package org.xtgo.xcube.base;
 
+import static org.xtgo.xcube.base.XcubeBase.LoadLibraryUtil.copyFile;
+
+import android.annotation.SuppressLint;
+import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.Application;
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.util.Log;
+import android.view.WindowManager;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.IOException;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
-
-import android.annotation.TargetApi;
-import android.os.Build;
-import android.os.Environment;
-import android.view.WindowManager;
-
-import java.io.ByteArrayOutputStream;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
-
-import static de.robv.android.xposed.XposedHelpers.findAndHookMethod;
 
 
 public class XcubeBase implements IXposedHookLoadPackage {
@@ -52,7 +51,8 @@ public class XcubeBase implements IXposedHookLoadPackage {
         String script = config.getScriptPath(loadPackageParam.packageName);
         Log.e(TAG, "current app packageName : " + loadPackageParam.packageName + ":" + remoteName);
 
-        XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
+        XC_MethodHook methodHook = new XC_MethodHook() {
+            @SuppressLint({"SdCardPath", "UnsafeDynamicallyLoadedCode"})
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 Log.d(TAG, "attach beforeHookedMethod script:" + script);
@@ -67,25 +67,50 @@ public class XcubeBase implements IXposedHookLoadPackage {
                     String ABI = android.os.Process.is64Bit() ? "arm64-v8a" : "armeabi-v7a";
                     //System.loadlibrary使用的classloader是当前classloader，而param.args[0]是目标应用的classloader，二者不同
                     Log.d(TAG, "attach beforeHookedMethod toPath:" + toPath);
-                    LoadLibraryUtil.loadSoFile(this.getClass().getClassLoader(), libpath + ABI, toPath);
-                    System.loadLibrary("xcubebase");
+                    /*
+                     这种写法有问题，无法实现加载so的功能
+                     LoadLibraryUtil.loadSoFile(this.getClass().getClassLoader(), libpath + ABI, toPath);
+                     System.loadLibrary("xcubebase");
+                    */
+                    copyFile(libpath + ABI, toPath.getAbsolutePath());
+                    System.load(toPath + "/libxcubebase.so");
                     Log.d(TAG, "script path :" + script);
                     gumjsHook(script);
                     hooked = true;
+                    Log.d(TAG, "hook suc");
                 } catch (Throwable throwable) {
                     throwable.printStackTrace();
                 }
 
             }
+        };
 
+        // 有些apk
+        XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, methodHook);
+        XposedHelpers.findAndHookMethod(ContextWrapper.class, "attachBaseContext", Context.class, methodHook);
 
-        });
         XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class, new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                 ((Activity) param.thisObject).getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
         });
+
+//        XposedHelpers.findAndHookMethod(
+//                "java.lang.Runtime",
+//                loadPackageParam.classLoader,
+//                "loadLibrary0",
+//                Class.class,
+//                String.class,
+//                new XC_MethodHook() {
+//                    @Override
+//                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+//                        Log.e(TAG, "go into loadLibrary0");
+//                        super.beforeHookedMethod(param);
+//                        //to native hook
+//                    }
+//                }
+//        );
     }
 
     public static class Utils {
@@ -178,9 +203,13 @@ public class XcubeBase implements IXposedHookLoadPackage {
                 try {
                     V25.install(classLoader, folder);
                 } catch (Throwable throwable) {
+                    Log.e(TAG, "V25.install error will use V23.install");
+                    throwable.printStackTrace();
                     try {
                         V23.install(classLoader, folder);
                     } catch (Throwable throwable1) {
+                        Log.e(TAG, "V23.install error will use V14.install");
+                        throwable.printStackTrace();
                         V14.install(classLoader, folder);
                     }
                 }
@@ -188,6 +217,7 @@ public class XcubeBase implements IXposedHookLoadPackage {
                 try {
                     V23.install(classLoader, folder);
                 } catch (Throwable throwable) {
+                    Log.e(TAG, "sdkInt >= 23 V23.install error will use V14.install");
                     V14.install(classLoader, folder);
                 }
             } else if (sdkInt >= 14) {
@@ -275,13 +305,25 @@ public class XcubeBase implements IXposedHookLoadPackage {
                     systemLibDirs = new ArrayList<>(2);
                 }
 
-                Method makePathElements = ReflectUtil.findMethod(dexPathList, "makePathElements", List.class);
-                libDirs.addAll(systemLibDirs);
+                final List<File> newLibDirs = new ArrayList<>(libDirs.size() + systemLibDirs.size() + 1);
+                newLibDirs.addAll(libDirs);
+                newLibDirs.addAll(systemLibDirs);
 
-                Object[] elements = (Object[]) makePathElements.invoke(dexPathList, libDirs);
-                Field nativeLibraryPathElements = ReflectUtil.findField(dexPathList, "nativeLibraryPathElements");
-                nativeLibraryPathElements.setAccessible(true);
+                final Method makeElements = ReflectUtil.findMethod(dexPathList, "makePathElements", List.class);
+
+                final Object[] elements = (Object[]) makeElements.invoke(dexPathList, newLibDirs);
+
+                final Field nativeLibraryPathElements = ReflectUtil.findField(dexPathList, "nativeLibraryPathElements");
                 nativeLibraryPathElements.set(dexPathList, elements);
+
+
+//                Method makePathElements = ReflectUtil.findMethod(dexPathList, "makePathElements", List.class);
+//                libDirs.addAll(systemLibDirs);
+//
+//                Object[] elements = (Object[]) makePathElements.invoke(dexPathList, libDirs);
+//                Field nativeLibraryPathElements = ReflectUtil.findField(dexPathList, "nativeLibraryPathElements");
+//                nativeLibraryPathElements.setAccessible(true);
+//                nativeLibraryPathElements.set(dexPathList, elements);
             }
         }
 
@@ -333,7 +375,9 @@ public class XcubeBase implements IXposedHookLoadPackage {
                 Log.d(TAG, "copy libs and config to : " + dirs);
                 copyFile(fromPath, dirs.getAbsolutePath());
                 installNativeLibraryPath(classLoader, dirs);
+//                TinkerLoadLibrary.installNativeLibraryPath(classLoader, dirs);
             } catch (Throwable throwable) {
+                throwable.printStackTrace();
                 Log.e("loadSoFile", "loadSoFile error " + throwable.getMessage());
             }
         }
@@ -369,7 +413,7 @@ public class XcubeBase implements IXposedHookLoadPackage {
          * @param toFile    应用的包路径
          * @return int
          */
-        private static int copyFile(String fromFiles, String toFile) {
+        public static int copyFile(String fromFiles, String toFile) {
             //要复制的文件目录
             File[] currentFiles;
             File root = new File(fromFiles);
@@ -493,11 +537,15 @@ public class XcubeBase implements IXposedHookLoadPackage {
                 throws NoSuchFieldException, IllegalArgumentException, IllegalAccessException {
             Field jlrField = findField(instance, fieldName);
 
+            Log.e(TAG, "jlrField: " + jlrField);
+            Log.e(TAG, "instance: " + instance);
+            Log.e(TAG, "jlrField.get: " + jlrField.get(instance));
+//            Log.e(TAG, "extraElements: " + extraElements);
+
             Object[] original = (Object[]) jlrField.get(instance);
             Object[] combined = (Object[]) Array.newInstance(original.getClass().getComponentType(), original.length + extraElements.length);
 
             // NOTE: changed to copy extraElements first, for patch load first
-
             System.arraycopy(extraElements, 0, combined, 0, extraElements.length);
             System.arraycopy(original, 0, combined, extraElements.length, original.length);
 
